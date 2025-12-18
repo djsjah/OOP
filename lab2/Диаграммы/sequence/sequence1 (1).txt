@@ -1,0 +1,32 @@
+@startuml
+title Centrifugo Subscription Flow (Authorized User)
+
+actor "Authorized User" as AuthUser
+participant "Frontend" as FE
+participant "Nginx" as NGINX
+participant "AuthService" as AuthSvc
+participant "Centrifugo\n(Realtime server)" as Cent
+
+== Получение Centrifugo JWT ==
+
+AuthUser -> FE : Открывает приложение
+FE -> NGINX : GET /api/centrifugo/token\n(access token)
+NGINX -> AuthSvc : Проверка JWT / user_id
+AuthSvc --> NGINX : Centrifugo JWT\n(connection + channels)
+NGINX --> FE : Centrifugo JWT
+
+== Установка WebSocket и подписка ==
+
+FE -> Cent : WebSocket CONNECT\n+ Centrifugo JWT
+Cent --> FE : CONNECT OK
+
+FE -> Cent : SUBSCRIBE\nк каналу personal:<user_id>
+Cent --> FE : SUBSCRIBE OK
+
+note over FE, Cent
+  Пользователь теперь подписан на свой
+  персональный канал personal:<user_id>.
+  Все realtime-события будут приходить сюда.
+end note
+
+@enduml

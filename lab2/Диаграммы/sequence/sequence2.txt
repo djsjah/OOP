@@ -1,0 +1,83 @@
+@startuml
+title 4.2.2. Чтение ленты с курсором и гидратацией
+
+actor "Authorized User" as User
+participant "Frontend" as FE
+participant "Nginx" as NGINX
+participant "AuthService" as AuthSvc
+participant "FeedService" as FeedSvc
+database  "Cassandra / ScyllaDB\n(feed)" as CAS
+database  "Redis\n(cache)" as REDIS
+database  "PostgreSQL\n(main DB)" as PG
+
+== Запрос ленты с курсором ==
+
+User -> FE : Скролл / запрос ленты\n(GET next page)
+FE -> NGINX : GET /feed?cursor=<cursor>&limit=20\n+ access token
+NGINX -> AuthSvc : Проверка токена\nи получение user_id
+AuthSvc --> NGINX : OK (user_id)
+NGINX -> FeedSvc : GET /feed\n(user_id, cursor, limit=20)
+
+== Чтение списка post_id из хранилища ленты ==
+
+activate FeedSvc
+FeedSvc -> CAS : SELECT post_id, author_id, score\nFROM feed\nWHERE user_id = :user_id\n  AND score < :cursor_score\nLIMIT :limit
+CAS --> FeedSvc : [post_id[], author_id[], score[]]
+
+note right of FeedSvc
+  Хранилище ленты уже содержит отсортированный
+  список постов (fan-out on write).
+  Мы получаем только идентификаторы постов и авторов.
+end note
+
+== Гидратация постов: чтение из Redis + PostgreSQL ==
+
+par MGET постов
+    FeedSvc -> REDIS : MGET post:{post_id[]}
+    REDIS --> FeedSvc : hit: PostDTO[],\nmiss: post_id_miss[]
+else MGET авторов
+    FeedSvc -> REDIS : MGET user:{author_id[]}
+    REDIS --> FeedSvc : hit: UserDTO[],\nmiss: author_id_miss[]
+else MGET статистики
+    FeedSvc -> REDIS : MGET post_stats:{post_id[]}
+    REDIS --> FeedSvc : hit: PostStatsDTO[],\nmiss: post_id_stats_miss[]
+end
+
+' --- Догрузка из основной БД по промахам кэша ---
+
+alt Есть посты, которых нет в кэше
+  FeedSvc -> PG : SELECT * FROM posts\nWHERE id IN (post_id_miss[])
+  PG --> FeedSvc : Post rows
+  FeedSvc -> REDIS : SET post:{id} = PostDTO\n(для каждого промаха)
+end
+
+alt Есть авторы, которых нет в кэше
+  FeedSvc -> PG : SELECT * FROM users\nWHERE id IN (author_id_miss[])
+  PG --> FeedSvc : User rows
+  FeedSvc -> REDIS : SET user:{id} = UserDTO\n(для каждого промаха)
+end
+
+alt Есть статистика, которой нет в кэше
+  FeedSvc -> PG : SELECT post_id, like_count,\n       comment_count\nFROM post_stats\nWHERE post_id IN (post_id_stats_miss[])
+  PG --> FeedSvc : PostStats rows
+  FeedSvc -> REDIS : SET post_stats:{id} = PostStatsDTO\n(для каждого промаха)
+end
+
+== Сборка ответа и курсора ==
+
+note over FeedSvc
+  FeedService собирает для каждого post_id:
+  - PostDTO
+  - UserDTO (автор)
+  - PostStatsDTO (лайки, комментарии)
+  и формирует список FeedItemDTO.
+  Новый cursor = score последнего элемента (из полученной партии).
+end note
+
+FeedSvc --> NGINX : HTTP 200\nFeedResponse(items[0..19], next_cursor)
+deactivate FeedSvc
+
+NGINX --> FE : FeedResponse
+FE -> User : Показать 20 постов\n+ сохранить next_cursor для следующего запроса
+
+@enduml

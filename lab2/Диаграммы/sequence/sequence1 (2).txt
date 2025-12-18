@@ -1,0 +1,68 @@
+@startuml
+title Publish Post with Outbox & CDC (Debezium + Kafka + Centrifugo)
+
+actor "Authorized User\n(Author)" as Author
+actor "Authorized User\n(Follower)" as Follower
+
+participant "Frontend\n(Author)" as FEAuthor
+participant "Frontend\n(Follower)" as FEFollower
+participant "Nginx" as NGINX
+participant "AuthService" as AuthSvc
+participant "PostService" as PostSvc
+database  "PostgreSQL\n(main DB)" as PG
+participant "Debezium\n(CDC connector)" as Debez
+queue      "Kafka\n(Message Broker)" as MB
+participant "Centrifugo\n(Realtime server)" as Cent
+
+== Публикация поста с записью в Outbox (cdc) ==
+
+Author -> FEAuthor : "Создать пост"
+FEAuthor -> NGINX : POST /posts\n(контент поста + access token)
+NGINX -> AuthSvc : Проверка токена / авторизации
+AuthSvc --> NGINX : OK (author_id)
+
+NGINX -> PostSvc : HTTP /posts\n(author_id, content)
+activate PostSvc
+
+PostSvc -> PG : BEGIN TRANSACTION
+PostSvc -> PG : INSERT INTO posts\n(author_id, content, created_at, ...)
+PostSvc -> PG : INSERT INTO cdc\n(method='broadcast/publish',\n payload={channels=[personal:<author_id>],\n  data={type=POST_CREATED, ...},\n  idempotency_key},\n partition=hash(author_id),\n created_at=NOW())
+PostSvc -> PG : COMMIT
+deactivate PostSvc
+
+note right of PG
+  Запись в posts и запись в cdc
+  происходят в одной транзакции (Outbox).
+  После COMMIT изменения попадают в WAL.
+end note
+
+== Debezium читает WAL и пишет в Kafka ==
+
+Debez -> PG : logical replication\n(read WAL changes)
+PG --> Debez : WAL stream\n(в т.ч. INSERT в cdc)
+Debez -> MB : produce CDC message\n(topic: cdc_events,\n key = partition,\n value = {method, payload, ...})
+
+== Centrifugo читает Kafka и публикует событие ==
+
+MB --> Cent : new CDC message\n(from cdc_events)
+activate Cent
+
+Cent -> Cent : parse {method, payload,\n idempotency_key}\n+ идемпотентная проверка
+
+note right of Cent
+  Centrifugo использует idempotency_key,
+  чтобы не публиковать одно и то же
+  событие повторно.
+end note
+
+Cent --> FEAuthor : WebSocket message\n(type=POST_CREATED,\n post_id, author, version, ...)
+Cent --> FEFollower : WebSocket message\n(type=POST_CREATED,\n post_id, author, version, ...)
+
+deactivate Cent
+
+== Обновление UI на клиентах ==
+
+FEAuthor -> Author : Обновление ленты\n(пост появился у автора)
+FEFollower -> Follower : Обновление ленты\n(пост появился у подписчика)
+
+@enduml

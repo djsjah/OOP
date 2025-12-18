@@ -1,0 +1,78 @@
+@startuml
+title Comment -> Event -> WebSocket Notification (CDC + Kafka + Centrifugo)
+
+actor "Authorized User\n(Comment Author)" as CommentAuthor
+actor "Authorized User\n(Post Author)" as PostAuthor
+
+participant "Frontend\n(Comment Author)" as FEComment
+participant "Frontend\n(Post Author)" as FEPost
+participant "Nginx" as NGINX
+participant "AuthService" as AuthSvc
+participant "CommentService" as CommentSvc
+database  "PostgreSQL\n(main DB)" as PG
+participant "Debezium\n(CDC connector)" as Debez
+queue      "Kafka\n(Message Broker)" as MB
+participant "Centrifugo\n(Realtime server)" as Cent
+
+== Создание комментария с записью в Outbox (cdc) ==
+
+CommentAuthor -> FEComment : "Оставить комментарий"
+FEComment -> NGINX : POST /posts/{post_id}/comments\n(content + access token)
+NGINX -> AuthSvc : Проверка токена / авторизации
+AuthSvc --> NGINX : OK (comment_author_id)
+
+NGINX -> CommentSvc : HTTP /posts/{post_id}/comments\n(comment_author_id, post_id, content)
+activate CommentSvc
+
+CommentSvc -> PG : BEGIN TRANSACTION
+
+' 1. Находим автора поста (кому слать уведомление)
+CommentSvc -> PG : SELECT user_id\nFROM posts\nWHERE id = :post_id
+PG --> CommentSvc : post_author_id
+
+' 2. Создаём комментарий
+CommentSvc -> PG : INSERT INTO comments\n(post_id, author_id, content, created_at, ...)
+
+' 3. Пишем событие в cdc (Outbox)
+CommentSvc -> PG : INSERT INTO cdc\n(method='broadcast/publish',\n payload={\n  channels=[personal:<post_author_id>],\n  data={type=COMMENT_CREATED,\n        post_id, comment_id,\n        comment_author_id, content, ...},\n  idempotency_key='comment_<comment_id>'},\n partition=hash(post_author_id),\n created_at=NOW())
+
+CommentSvc -> PG : COMMIT
+deactivate CommentSvc
+
+note right of PG
+  В одной транзакции фиксируются:
+  - новая запись в comments
+  - новая запись в cdc (Outbox)
+  После COMMIT изменения попадают в WAL.
+end note
+
+== Debezium читает WAL и отправляет в Kafka ==
+
+Debez -> PG : logical replication\n(read WAL changes)
+PG --> Debez : WAL stream\n(в т.ч. INSERT в cdc)
+Debez -> MB : produce CDC message\n(topic: cdc_events,\n key = partition,\n value = {method, payload, ...})
+
+== Centrifugo читает Kafka и публикует уведомление ==
+
+MB --> Cent : new CDC message\n(from cdc_events)
+activate Cent
+
+Cent -> Cent : parse {method, payload,\n idempotency_key}\n+ идемпотентная проверка
+
+note right of Cent
+  Centrifugo использует idempotency_key
+  (например, "comment_<comment_id>"),
+  чтобы не публиковать одно и то же
+  событие повторно.
+end note
+
+' Публикация в канал автора поста
+Cent --> FEPost : WebSocket message\n(type=COMMENT_CREATED,\n post_id, comment_id,\n comment_author, content, ...)
+
+deactivate Cent
+
+== Обновление UI у автора поста ==
+
+FEPost -> PostAuthor : Уведомление о новом\nкомментарии к посту\n+ обновление UI
+
+@enduml

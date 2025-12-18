@@ -1,0 +1,148 @@
+@startuml
+title Logical Data Model (Relational + Non-Relational)
+
+skinparam classAttributeIconSize 0
+
+' ===================== Реляционная часть (PostgreSQL) =====================
+
+class User <<relational>> {
+  +internal_id: bigint {PK}
+  --
+  subject: text {UNIQUE}
+  nickname: varchar(64) {UNIQUE}
+  image_url: varchar(255) {UNIQUE}
+  created_at: timestamp
+}
+
+class Subscription <<relational>> {
+  +id: bigint {PK}
+  --
+  author_id: bigint {FK -> User.internal_id}
+  follower_id: bigint {FK -> User.internal_id}
+  created_at: timestamp
+  --
+  {UNIQUE(author_id, follower_id)}
+}
+
+class Post <<relational>> {
+  +id: bigint {PK}
+  --
+  user_id: bigint {FK -> User.internal_id}
+  subject: varchar(255)
+  content: text
+  media_urls: jsonb
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+class Comment <<relational>> {
+  +id: bigint {PK}
+  --
+  author_id: bigint {FK -> User.internal_id}
+  post_id: bigint {FK -> Post.id}
+  parent_id: bigint {FK -> Comment.id}
+  content: text
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+class CdcEvent <<relational>> {
+  +id: bigint {PK}
+  --
+  method: centrifugo_method
+  payload: jsonb
+  partition: bigint
+  created_at: timestamp
+}
+
+' (опционально) агрегированная статистика по постам в реляционной БД
+class PostStats <<relational>> {
+  +post_id: bigint {PK, FK -> Post.id}
+  --
+  like_count: bigint
+  comment_count: bigint
+  updated_at: timestamp
+}
+
+' ===================== Связи между реляционными сущностями =====================
+
+User "1" -- "0..*" Post : author
+User "1" -- "0..*" Comment : author
+
+Post "1" -- "0..*" Comment : comments
+
+' подписки: пользователь как автор и как подписчик
+User "1" -- "0..*" Subscription : asAuthor\n(author_id)
+User "1" -- "0..*" Subscription : asFollower\n(follower_id)
+
+Post "1" -- "0..1" PostStats : stats
+
+' ===================== Нереляционная часть: хранилище ленты (Cassandra/Scylla) =====================
+
+class FeedItem <<feedStore>> {
+  --
+  user_id: bigint         ' владелец ленты
+  post_id: bigint         ' id поста
+  score: timestamp        ' время / рейтинг
+  --
+  ' PRIMARY KEY (user_id, score, post_id)
+}
+
+note right of FeedItem
+  Хранится в Cassandra/ScyllaDB (feed storage).
+  PRIMARY KEY (user_id, score, post_id)
+  CLUSTERING ORDER BY (score DESC, post_id DESC).
+  Используется для fan-out on write и
+  чтения ленты по курсору.
+end note
+
+' Логическая связь: элементы ленты ссылаются на Post/User по id
+FeedItem ..> Post : post_id
+FeedItem ..> User : user_id
+
+' ===================== Нереляционная часть: кэш (Redis) =====================
+
+class PostCacheEntry <<cache>> {
+  key: "post:{post_id}"
+  value: PostDTO
+  ttl: seconds
+}
+
+class UserCacheEntry <<cache>> {
+  key: "user:{user_id}"
+  value: UserDTO
+  ttl: seconds
+}
+
+class PostStatsCacheEntry <<cache>> {
+  key: "post_stats:{post_id}"
+  value: PostStatsDTO
+  ttl: seconds
+}
+
+note right of PostCacheEntry
+  Хранятся в Redis.
+  Используются FeedService для гидратации
+  ленты по списку post_id:
+  - сначала MGET по кэшу,
+  - при промахе чтение из PostgreSQL
+    и догрузка в Redis.
+end note
+
+' Логические связи между кэшем и реляционными сущностями
+PostCacheEntry ..> Post : кеширует
+UserCacheEntry ..> User : кеширует
+PostStatsCacheEntry ..> PostStats : кеширует
+
+' ===================== Нереляционная часть: события CDC =====================
+
+CdcEvent <<cdcEvent>>
+
+note right of CdcEvent
+  Outbox/CDC таблица.
+  Хранится в PostgreSQL, но семантически
+  используется Debezium для чтения изменений
+  и публикации событий в Kafka для Centrifugo.
+end note
+
+@enduml
