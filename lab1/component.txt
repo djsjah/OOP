@@ -1,0 +1,75 @@
+@startuml
+allowmixing
+left to right direction
+
+' Основные компоненты
+component "Frontend-Service" as frontend
+component "Cloudflare\n<<loadBalancerL7>>\n<<CDN>>\n<<Reverse Proxy>>" as cloudflare {
+    component "RateLimiter" as rl_cloudflare
+}
+
+component "Backend-Service\n<<REST API>>" as backend {
+    component "Core-Service\n<<service>>" as core_service
+    component "UrlValidator\n<<service>>" as url_validator
+    component "UrlKeyService\n<<service>>" as url_key_service
+    component "UrlRepository\n<<repository>>" as url_repository
+}
+
+' Интерфейс
+interface "IUrlService" as IUrlService {
+    + GET /{url_id} → Редирект на длинный URL
+    + GET /api/urls/{url_id} → Информация о URL (JSON)
+    + POST /api/urls → Создание короткого URL
+}
+
+' Хранилище
+package "Data" {
+    component "DynamoDB\n<<database>>\n<<replicated>>" as dynamodb
+    component "Redis Cache\n<<cache>>" as redis_cache
+    component "TTL Cleanup Worker\n<<background>>" as ttl_cleanup
+}
+
+' Мониторинг и логирование
+package "Monitoring" {
+    component "Prometheus\n<<monitoring>>" as prometheus
+    component "Grafana\n<<dashboard>>" as grafana
+    component "Logs\n<<logging>>" as logs
+}
+
+' Внешние связи
+frontend --> cloudflare
+cloudflare --> backend
+
+' Внутренние связи Backend
+core_service --> url_validator
+core_service --> url_key_service
+core_service --> url_repository
+
+' Cache-Aside (Lazy Loading)
+url_repository --> redis_cache : "GET [cache hit]"
+url_repository --> dynamodb : "GET [cache miss]"
+dynamodb --> url_repository : "URL data"
+url_repository --> redis_cache : "SET after DB read"
+
+' TTL cleanup
+dynamodb --> ttl_cleanup
+
+' Monitoring
+backend --> prometheus
+prometheus --> grafana
+backend --> logs
+
+' Интерфейс
+backend -up-|> IUrlService
+
+' Легенда
+note right of url_repository
+Cache strategy:
+Cache-Aside (Lazy Loading)
+
+1. Read from Redis
+2. On miss → read from DB
+3. Fill cache
+end note
+
+@enduml
